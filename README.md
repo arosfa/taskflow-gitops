@@ -1,41 +1,57 @@
-# taskflow-gitops — dépôt GitOps du cours CI/CD M2
+## Labo — déployer par PR, dérive, retour arrière
 
-Ce dépôt décrit **l'état voulu** de l'application TaskFlow dans Kubernetes.
-Argo CD le surveille et aligne le cluster dessus : pour changer la production,
-on ne tape pas de commande, on fait une **Pull Request**.
+Équipe : arosfa. Fork : https://github.com/arosfa/taskflow-gitops
 
-## Installation (à faire chez vous, avant le cours)
+Environnement : cluster kind `kind-cicd` sur macOS, Argo CD v3.5.3, relecture de Git toutes les 60 s.
+Argo CD surveille la branche `main`, dossier `apps/taskflow`, avec `selfHeal` et `prune` activés.
+Ruleset sur `main` : pull request obligatoire.
 
-Prérequis : Docker Desktop démarré, 8 Go de RAM, 10 Go de disque libre.
-Sous Windows : WSL2 (Ubuntu) + intégration WSL de Docker Desktop, et toutes les commandes dans WSL.
+### Journal des déploiements
 
-```bash
-git clone https://github.com/9m7fjfpv9k-cyber/taskflow-gitops.git
-cd taskflow-gitops
-./scripts/install.sh
-```
+| Heure | Action | PR / commit | Version observée | Qui a agi |
 
-Le script crée un cluster local `kind`, installe Argo CD et Argo Rollouts,
-puis télécharge les images des labs. Comptez 5 à 15 minutes.
-Il peut être relancé sans risque.
+ `kubectl apply -f argocd/application.yaml` | - | 1.0.0, 4 pods, Synced + Healthy | moi (déclaration), Argo CD (déploiement) |
+Merge de « Passer TaskFlow en image 2.0.0 » | PR #1, commit `fe71d47` | encore 1.0.0 | moi, dans Git |
+Synchronisation automatique | `fe71d47` | 2.0.0 | Argo CD |
+| 12:31:28 | Contrôle avec `observe.sh` | - | 40 réponses `version=2.0.0 http=200` | - |
 
-## Structure
+### 1. Premier déploiement (1.0.0)
 
-| Chemin | Rôle |
-| --- | --- |
-| `apps/taskflow/` | Les manifests surveillés par Argo CD |
-| `argocd/application.yaml` | Déclare l'application dans Argo CD |
-| `exemples/bluegreen/` | Manifests pour le déploiement Blue-Green |
-| `exemples/canary/` | Manifests pour le déploiement Canary |
-| `scripts/install.sh` | Installation de l'environnement |
-| `scripts/argocd-ui.sh` | Ouvre l'interface d'Argo CD |
-| `scripts/observe.sh` | Montre quelle version répond, et avec quel code HTTP |
+`kubectl apply -f argocd/application.yaml` ne déploie rien lui-même : il déclare l'application à Argo CD.
+C'est Argo CD qui lit ensuite le dépôt et crée le namespace, le Deployment et le Service.
+Résultat : 4 pods en image 1.0.0, application Synced et Healthy, `observe.sh` : 40 réponses `version=1.0.0 http=200`.
 
-## Images disponibles
+![État initial]
+![alt text](image-1.png)
 
-`ghcr.io/9m7fjfpv9k-cyber/taskflow` en versions `1.0.0`, `1.1.0`, `2.0.0` et `2.1.0`.
+### 2. Déploiement de la 2.0.0 par PR
 
-## Équipe
+La PR #1 change une seule ligne de `apps/taskflow/deployment.yaml` : l'image passe de 1.0.0 à 2.0.0.
+Après le merge, aucune commande n'a été lancée sur le cluster. Argo CD a vu le nouveau commit
+à sa relecture suivante de Git, puis a remplacé les pods.
+Délai mesuré entre le merge et la 2.0.0 : __ s.
 
-<!-- Noms du binôme -->
-- À compléter
+![Diff de la PR 1]
+![alt text](image-2.png)
+
+![observe.sh en 2.0.0]
+![alt text](image-3.png)
+
+
+
+### 3. Dérive - à compléter
+
+### 4. Revert - à compléter
+
+### 5. Bonus prune - à compléter
+
+### Réponses
+
+**Push ou pull ?** Pull. Le merge n'a rien envoyé au cluster, qui tourne en local et que GitHub
+ne peut pas joindre. C'est Argo CD, depuis le cluster, qui interroge Git toutes les 60 s et applique
+ce qu'il y trouve. Le délai observé après le merge correspond à cette attente.
+
+**Qui a corrigé quoi ?** Pour le déploiement, j'ai corrigé Git (PR #1) et Argo CD a aligné le cluster.
+Dérive : à compléter.
+
+**Pourquoi git revert ?** À compléter après l'étape 4.
