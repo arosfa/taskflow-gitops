@@ -1,4 +1,5 @@
 # taskflow-gitops — dépôt GitOps du cours CI/CD M2
+# Karim HADDADI, Binhome Ahmes EROSFA
 
 Ce dépôt décrit **l'état voulu** de l'application TaskFlow dans Kubernetes.
 Argo CD le surveille et aligne le cluster dessus : pour changer la production,
