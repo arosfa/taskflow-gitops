@@ -422,7 +422,7 @@ Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.1.0 (stable)
 | `diff -r exemples/robustesse apps/taskflow` | identiques, sauf la ligne de l'image | je n'ai pas mal configuré les fichiers |
 
 Le même scénario donnait donc 0 % d'erreurs pendant l'analyse et 25 % à la main. Et pendant l'analyse, la réponse la plus lente était à 16 ms,
-alors qu'aucune réponse de la 2.1.0 ne descend sous 301 ms. Le test n'avait pas parlé à la 2.1.0.
+alors qu'aucune réponse de la 2.1.0 ne descend sous 300 ms. Le test n'avait pas parlé à la 2.1.0.
 
 **B3. Le revert, bloqué.** J'ai fait le revert de la PR #14. L'analyse a alors refusé le retour à la version saine :
 
