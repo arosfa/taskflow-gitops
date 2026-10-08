@@ -573,3 +573,79 @@ ainsi que les deux analyses faussées du matin :
 
 Un test automatique qui passe ne prouve rien si on ne sait pas ce qu'il a testé. Après correction, le filet de sécurité a fait son travail :
 un pod exposé pendant 48 secondes, contre 44 minutes d'incident le matin.
+
+## Labo 4 : la mini-PSSI en quality gates
+
+Fait seul le 8 octobre, de 16:20 à 18:35.
+
+### En bref
+
+Jusqu'ici, tout ce que je mergeais dans Git partait en production. Dans ce labo, j'ai mis des gardiens à la porte :
+avant le merge, deux contrôles automatiques vérifient que ma PR respecte les 5 règles de la mini-PSSI.
+`conftest` lit mes fichiers YAML (règles R1 à R4) et Trivy cherche les failles dans mes images (règle R5).
+Tant qu'un des deux est rouge, le bouton Merge est bloqué.
+
+La différence avec le labo 3 : k6 vérifie que la version **fonctionne**, une fois déployée.
+Ici on vérifie que les fichiers sont **conformes**, avant même le merge. Les deux se complètent.
+
+### Tableau règle, contrôle, outil, preuve
+
+| Règle | Contrôle | Outil | Preuve |
+|---|---|---|---|
+| R1 : jamais `latest`, toujours un tag | refus si l'image n'a pas de `:` ou finit par `:latest` | conftest, job « PSSI manifests (conftest) » | PR #23 bloquée : `PSSI-R1 : le conteneur 'taskflow' utilise le tag latest (nginx:latest)` |
+| R2 : images du registre du cours uniquement | refus si l'image ne commence pas par `ghcr.io/9m7fjfpv9k-cyber/` | conftest, même job | PR #23 bloquée : `PSSI-R2 : l'image du conteneur 'taskflow' ne vient pas du registre autorisé (nginx:latest)` |
+| R3 : une limite mémoire par conteneur | `not c.resources.limits.memory` (règle écrite par moi) | conftest, même job | 25 tests réussis sur 25 : mon conteneur a `limits.memory: 256Mi` |
+| R4 : jamais root | `pod_non_root`, puis `not pod_non_root` dans un `deny` (règle écrite par moi) | conftest, même job | échec R4 avant correction (24/25), 25/25 après ; `id -u` dans un pod = 10001 |
+| R5 : pas de faille HIGH ou CRITICAL corrigeable | scan de l'image avec `--severity HIGH,CRITICAL --ignore-unfixed` | Trivy, job « PSSI images (Trivy) » | rouge sur la PR #22 (9 failles HIGH), vert sur la PR #24 après l'exception datée dans `.trivyignore` |
+
+Les deux jobs sont obligatoires sur `main` grâce au ruleset `Pssi` :
+
+![Ruleset Pssi : les deux contrôles obligatoires](labo4-01-ruleset.png)
+
+La PR non conforme, que j'ai laissée ouverte exprès comme preuve. conftest est rouge et « Required », le bouton Merge est grisé :
+
+![PR 23 bloquée par conftest](labo4-02-pr-bloquee.png)
+
+### Ce que j'ai fait, dans l'ordre
+
+1. **État de départ.** `conftest test apps/ --policy policies/` : 15 tests, 15 réussis. Seules R1 et R2 existaient
+   (5 fichiers × 3 contrôles).
+2. **Écriture de R3 et R4** dans `policies/kubernetes.rego`. Résultat : 25 tests, 24 réussis, 1 échec :
+   `PSSI-R4 : le pod de Rollout 'taskflow' ne déclare pas securityContext.runAsNonRoot: true`.
+   Mes règles marchent : conftest a trouvé tout seul ce qui manquait à mon Rollout.
+3. **Correction du Rollout** : `securityContext: runAsNonRoot: true` au niveau du pod. 25 tests, 25 réussis.
+   Avant de merger, j'ai vérifié avec `id -u` dans un pod : l'application tourne en utilisateur 10001, pas en root (0).
+   Sinon Kubernetes aurait refusé de démarrer les pods.
+4. **Pipeline** : `exemples/ci/pssi-github.yml` copié en `.github/workflows/pssi.yml` (PR #22, commit `6c640bc`).
+   Après le merge, le Canary est allé au bout : révision 11, analyse k6 réussie, 4 pods prêts.
+5. **Ruleset** `Pssi`, actif sur `main`, avec les deux contrôles obligatoires.
+6. **PR non conforme** (#23, image `nginx:latest`) : 2 échecs en local (R1 et R2), puis blocage sur GitHub.
+7. **Trivy** : 9 failles HIGH, 0 CRITICAL, dans deux bibliothèques Python de l'image 2.2.0
+   (`starlette` 0.41.3 : 3 failles, `urllib3` 1.26.20 : 6 failles). Exception datée par PR (#24).
+
+### Pourquoi une exception et pas une correction
+
+Corriger voudrait dire reconstruire l'image avec `starlette` ≥ 1.3.1 et `urllib3` ≥ 2.8.0. Je ne construis pas cette image,
+et R2 m'interdit d'en utiliser une autre. Il me restait l'exception prévue par la PSSI : écrite, justifiée, datée, validée par PR.
+
+Dans `.trivyignore`, chaque faille est listée avec `exp:2026-11-08`. Passé cette date, Trivy ne tient plus compte de l'exception
+et redevient rouge tout seul : elle ne peut pas être oubliée. Une exception n'est pas une correction, les failles sont toujours
+dans l'image. La vraie suite, c'est de demander une image à jour avant le 8 novembre.
+
+### Ce qui m'a posé problème dans ce labo
+
+- **J'ai mergé la PR #22 alors que Trivy était rouge.** GitHub m'a laissé faire, parce que `main` n'était pas encore protégé.
+  C'est là que j'ai compris : un contrôle qui n'est pas obligatoire donne un avis, il ne bloque rien.
+- **J'ai mal tapé le nom d'un contrôle dans le ruleset** : `PSSI images (Trivy`, sans la parenthèse, en « Any source ».
+  GitHub attendait un contrôle qui n'existe pas, donc il restait « Waiting » pour toujours et toutes mes PR auraient été bloquées.
+  Il faut choisir le nom dans les suggestions marquées « GitHub Actions ».
+- **J'ai lancé un bloc de commandes deux fois** : le commit est parti sur mon `main` local au lieu de la branche.
+  Réparé avec `git branch -f main origin/main`. Rien n'était arrivé sur GitHub, puisque `main` y est protégé.
+
+### Ce que je retiens
+
+- La chaîne complète, maintenant : PR → conftest et Trivy (conformité) → merge → Argo CD → Canary → k6 (fonctionnement) → 100 %.
+- Sur la PR #23, Trivy est vert en 5 secondes, mais ça ne veut pas dire que `nginx` est sûr : le pipeline ne scanne que les images
+  du registre du cours, donc il n'a rien scanné. C'est conftest, avec R2, qui arrête cette image. Un contrôle seul ne suffit pas.
+- Le ruleset s'applique à moi aussi : même pour ma PR conforme (#24), le bouton Merge est resté grisé jusqu'à ce que
+  les deux contrôles soient verts.
