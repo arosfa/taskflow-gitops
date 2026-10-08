@@ -39,7 +39,7 @@ Il peut être relancé sans risque.
 
 - arosfa (seul, sans binôme)
 
-## Labo : déployer par PR, dérive, retour arrière
+## Labo 1 : déployer par PR, dérive, retour arrière
 
 Auteur : arosfa. Labo fait seul, sans binôme. Commencé en fin de séance le 7 octobre, continué le soir et dans la nuit.
 Fork : https://github.com/arosfa/taskflow-gitops
@@ -184,3 +184,155 @@ et il passe par une PR comme tout le reste.
 
 Pendant tout le labo, je n'ai lancé aucune commande de déploiement. J'ai changé Git, et Argo CD a fait le reste.
 Les seules fois où j'ai touché au cluster directement, ça n'a pas tenu.
+
+## Labo 2 : Blue-Green puis Canary avec Argo Rollouts
+
+Fait seul le 8 octobre, de 09:25 à 09:53. Parcours : 1.0.0 → Blue-Green → 1.1.0 → Canary → 2.0.0, puis essai de la 2.1.0 et abort.
+
+La règle reste la même que dans le premier labo : chaque changement passe par une PR, et c'est Argo CD qui l'applique.
+La nouveauté : un Rollout remplace le Deployment, et c'est Argo Rollouts qui gère le passage d'une version à l'autre.
+
+### Journal des déploiements
+
+| Heure (8 oct.) | Action | PR / commit | Ce que j'ai observé | Qui a agi |
+|---|---|---|---|---|
+| vers 09:25 | Merge de « Remplacer le Deployment par un Rollout Blue-Green » | PR #5, commit `972c496` | à 09:27:07 : Rollout Healthy, 4 nouveaux pods en 1.0.0, anciens pods du Deployment supprimés | moi (Git), Argo CD (déploiement et prune) |
+| vers 09:30 | Merge de « Blue-Green : image 1.1.0 » | commit `26f26a0` | à 09:32:02 : Rollout en pause, 8 pods (4 en 1.0.0, 4 en 1.1.0) | moi (Git), Argo CD, Argo Rollouts |
+| 09:33:13 | `observe.sh` sur les deux Services | - | `taskflow` : 40 × 1.0.0, `taskflow-preview` : 40 × 1.1.0 | - |
+| 09:33:20 | `promote` | - | `taskflow` : 40 × 1.1.0 juste après | moi (promote), Argo Rollouts (bascule) |
+| vers 09:38 | Merge de « Canary : Rollout canary en image 1.1.0 » | commit `a005f00` | à 09:38:59 : stratégie Canary, 4 pods en 1.1.0, aucun redémarrage | moi (Git), Argo CD |
+| vers 09:40 | Merge de « Canary : image 2.0.0 » | commit `7b16617` | à 09:40:56 : pause à 25 %, 1 pod en 2.0.0 et 3 en 1.1.0, 33 réponses en 1.1.0 et 7 en 2.0.0 | moi (Git), Argo CD, Argo Rollouts |
+| 09:42:47 | `promote` | - | 50 %, 75 % puis 100 % sans intervention ; à 09:44:34 : 4 pods en 2.0.0, 40 × 2.0.0 | moi (promote), Argo Rollouts (paliers) |
+| vers 09:45 | Merge de « Canary : image 2.1.0 » | commit `a5bce6a` | à 09:47:35 : pause à 25 %, 1 pod en 2.1.0, des réponses `http=500` (1 puis 6 sur 40) | moi (Git), Argo CD, Argo Rollouts |
+| 09:48:10 | `abort` | - | à 09:48:25 : 4 pods en 2.0.0, 40 × `http=200`, Rollout Degraded, application Synced + Degraded | moi (abort), Argo Rollouts |
+| vers 09:52 | Merge du revert de la PR 2.1.0 | PR de revert | à 09:53:12 : Rollout Healthy en 2.0.0, application Synced + Healthy | moi (Git), Argo CD |
+
+Les heures exactes des merges sont visibles sur les PR.
+
+### A. Blue-Green : de 1.0.0 à 1.1.0
+
+**A1. Le Rollout remplace le Deployment.** J'ai supprimé `deployment.yaml` et copié les trois fichiers de `exemples/bluegreen/`
+dans `apps/taskflow/`. Après le merge, Argo CD a créé le Rollout avec 4 nouveaux pods en 1.0.0 et a supprimé
+les pods de l'ancien Deployment, puisque son fichier n'était plus dans Git (`prune`).
+
+*Capture ci-dessous (09:27:07) : le Rollout est Healthy, stratégie BlueGreen, 4 pods en 1.0.0.*
+
+![Blue-Green : Rollout Healthy, 4 pods en 1.0.0](labo2-01-bluegreen-rollout.png)
+
+**A2 et A3. La nouvelle version démarre à côté.** Après la PR qui passe l'image en 1.1.0, le Rollout s'est mis en pause.
+Il y avait 8 pods : 4 bleus en 1.0.0 (`stable, active`) et 4 verts en 1.1.0 (`preview`).
+La production répondait toujours en 1.0.0 (40 sur 40), et seul le Service `taskflow-preview` répondait en 1.1.0 (40 sur 40).
+
+*Capture ci-dessous (09:32:02) : le Rollout est en pause, avec 8 pods, 4 en 1.0.0 et 4 en 1.1.0.*
+
+![Blue-Green : Rollout en pause, 8 pods](labo2-02-bluegreen-pause.png)
+
+**A4. La bascule.** À 09:33:20, j'ai lancé `promote`. La mesure suivante sur la production donnait 40 réponses sur 40 en 1.1.0,
+sans aucune erreur. Les pods bleus sont restés 30 secondes (`scaleDownDelaySeconds`), puis ont été supprimés :
+à 09:34:03, il ne restait que les 4 pods en 1.1.0.
+
+*Capture ci-dessous (09:33:13, 09:33:20 et 09:34:03) : observe.sh sur les deux Services, le promote, la production en 1.1.0, puis les pods bleus supprimés.*
+
+![Blue-Green : observe.sh, promote, production en 1.1.0](labo2-03-bluegreen-promote.png)
+
+**Mon analyse du Blue-Green**
+
+Avant la bascule, aucun utilisateur n'a vu la 1.1.0 : j'ai pu la tester sur la preview pendant que la production tournait normalement.
+La bascule a été nette : tout en 1.0.0, puis tout en 1.1.0, sans mélange. Et pendant 30 secondes,
+l'ancienne version était encore là, prête à reprendre si besoin.
+
+Le prix à payer se lit dans la capture : 8 pods au lieu de 4 pendant la transition, donc le double de ressources.
+
+### B. Canary : de 1.1.0 à 2.0.0, puis la 2.1.0
+
+**B1. Changer de stratégie.** J'ai remplacé le Rollout par celui de `exemples/canary/`, en gardant l'image 1.1.0.
+Les pods n'ont pas redémarré : seule la façon de déployer a changé, pas la version.
+
+*Capture ci-dessous (09:38:59) : stratégie Canary, 4 pods en 1.1.0.*
+
+![Canary : stratégie Canary, 4 pods en 1.1.0](labo2-04-canary-strategie.png)
+
+**B2. La 2.0.0 par paliers.** Après la PR, le Rollout s'est arrêté au premier palier : 1 pod en 2.0.0 (`canary`) et 3 en 1.1.0 (`stable`).
+`observe.sh` a donné 33 réponses en 1.1.0 et 7 en 2.0.0.
+
+*Capture ci-dessous (09:40:56) : pause à 25 %, 1 pod en 2.0.0 et 3 en 1.1.0, réponses mélangées.*
+
+![Canary : pause à 25 %, réponses 33 / 7](labo2-05-canary-25-pourcent.png)
+
+Après mon `promote` de 09:42:47, les paliers suivants se sont enchaînés tout seuls : 50 % avec 60 s de pause,
+75 % avec 30 s de pause, puis 100 %. À 09:44:34, les 4 pods étaient en 2.0.0 et les 40 réponses aussi.
+Les pods avaient des âges différents (de 6 s à presque 4 min) : ils ont bien été remplacés un par un.
+
+*Capture ci-dessous (09:42:47) : le promote, puis le palier à 50 %.*
+
+![Canary : promote, puis palier à 50 %](labo2-06-canary-promote-50.png)
+
+**B3. La 2.1.0 et l'abort.** Au palier de 25 %, `observe.sh` a montré des erreurs : 1 réponse `http=500` sur 40,
+puis 6 sur 40 à la mesure suivante. Les réponses en 2.0.0 étaient toutes en `http=200`.
+Pourtant, le pod en 2.1.0 était `Running` et `Healthy` pour Kubernetes.
+
+*Capture ci-dessous (09:47:35) : pause à 25 % en 2.1.0, avec des réponses http=500.*
+
+![Canary : la 2.1.0 à 25 %, avec des http=500](labo2-07-canary-erreurs-500.png)
+
+À 09:48:10, j'ai lancé `abort`. Quinze secondes plus tard, le pod en 2.1.0 avait disparu,
+4 pods tournaient en 2.0.0 et les 40 réponses étaient en `http=200`.
+
+*Capture ci-dessous (09:48:10) : après l'abort, Rollout Degraded et application Synced + Degraded.*
+
+![Canary : après l'abort, Rollout Degraded](labo2-08-canary-abort.png)
+
+**Et après l'abort ?** Les utilisateurs étaient protégés, mais rien n'était réglé. Le Rollout était `Degraded`
+et l'application `Synced` mais `Degraded` : Git demandait toujours la 2.1.0. L'abort est un frein d'urgence, pas une réparation.
+J'ai donc fait un revert de la PR 2.1.0. À 09:53:12, le Rollout était de nouveau `Healthy` en 2.0.0
+et l'application `Synced` et `Healthy`.
+
+*Capture ci-dessous (09:53:12) : après le revert, tout est Healthy en 2.0.0.*
+
+![Canary : après le revert, Healthy en 2.0.0](labo2-09-canary-revert.png)
+
+**Mon analyse du Canary**
+
+Le Canary expose de vrais utilisateurs, mais peu à la fois. Avec la 2.1.0, quelques requêtes ont échoué,
+alors qu'une bascule complète aurait touché tout le monde.
+
+Deux choses m'ont marqué. D'abord, Kubernetes ne voyait pas le bug : le pod était en bonne santé, et seules les vraies requêtes
+montraient les erreurs 500. Ensuite, le « 25 % » n'est pas un vrai pourcentage ici : sans routeur de trafic, c'est 1 pod sur 4,
+et la répartition des requêtes est aléatoire. J'ai mesuré 7 réponses sur 40 en 2.0.0, soit 17,5 %.
+
+### promote et abort : est-ce une dérive ?
+
+Ce sont des commandes lancées directement sur le cluster, comme le `kubectl scale` du premier labo.
+Mais Argo CD ne les a pas annulées. La différence, telle que je la comprends : `promote` et `abort` ne changent pas
+ce que Git décrit, ils pilotent seulement l'avancement du Rollout. L'abort laisse quand même un écart entre ce qui tourne (2.0.0)
+et ce que Git demande (2.1.0), et c'est pour ça qu'il a fallu corriger Git ensuite.
+
+### Blue-Green ou Canary pour TaskFlow ?
+
+Pour TaskFlow, je choisirais le Blue-Green.
+
+**Le risque.** En Blue-Green, aucun utilisateur n'a vu la nouvelle version avant ma bascule : la production répondait
+40 fois sur 40 en 1.0.0 pendant que je testais la preview. En Canary, de vrais utilisateurs ont reçu la version boguée :
+avec la 2.1.0, jusqu'à 6 requêtes sur 40 ont fini en erreur 500 avant mon abort. Je pense que j'aurais pu voir ce bug
+en lançant `observe.sh` sur `taskflow-preview`, sans toucher un seul utilisateur.
+
+**Le coût.** Le Blue-Green a demandé 8 pods au lieu de 4 pendant la transition. Pour TaskFlow, 4 petits pods
+de plus pendant quelques minutes, c'est peu. Le Canary est resté à 4 pods.
+
+**La limite du Canary ici.** Sans routeur de trafic, le plus petit palier est 1 pod sur 4, donc environ un quart des requêtes.
+C'est beaucoup pour un premier test.
+
+Je changerais d'avis dans trois cas : si l'application avait beaucoup plus de pods, parce que tout doubler coûterait cher ;
+si on avait un routeur de trafic pour n'envoyer que 1 ou 5 % des requêtes ; ou si le bug ne se voyait qu'avec du vrai trafic.
+
+### Ce qui m'a posé problème dans ce labo
+
+- J'ai lancé deux fois le même bloc de commandes. La branche existait déjà, donc mon commit est parti sur `main`
+  en local et la PR était vide. Corrigé en ramenant le commit sur la bonne branche.
+- GitHub m'a encore proposé le dépôt du prof comme cible de PR. J'utilise maintenant un lien direct de comparaison dans mon fork.
+- Après un merge, le cluster ne change pas tout de suite : il faut attendre la relecture de Git par Argo CD, jusqu'à une minute.
+
+### Ce que je retiens
+
+Argo CD décide de ce qui doit tourner, à partir de Git. Argo Rollouts décide de la manière d'y arriver, en Blue-Green ou en Canary.
+Dans les deux cas, quand ça se passe mal, la vraie correction se fait dans Git.
