@@ -340,3 +340,236 @@ si on avait un routeur de trafic pour n'envoyer que 1 ou 5 % des requêtes ; ou 
 
 Argo CD décide de ce qui doit tourner, à partir de Git. Argo Rollouts décide de la manière d'y arriver, en Blue-Green ou en Canary.
 Dans les deux cas, quand ça se passe mal, la vraie correction se fait dans Git.
+
+## Labo 3 : analyse automatique, incident 2.1.0 et postmortem
+
+Fait seul le 8 octobre, de 11:09 à 14:06. Parcours prévu : 2.0.0 → 2.1.0 → abandon automatique → 2.2.0.
+Le postmortem complet est dans [docs/postmortem-2.1.0.md](docs/postmortem-2.1.0.md).
+
+### En bref
+
+Au labo 2, c'est moi qui avais vu les erreurs de la 2.1.0 et lancé `abort`. Ici, un test de charge k6 doit le faire tout seul,
+au palier de 25 %. Chez moi, ça ne s'est pas passé comme prévu : le test a accepté la 2.1.0, elle est partie en production,
+puis le même test a refusé le retour à la version saine. J'ai cherché pourquoi, corrigé le test en trois lignes, et refait l'essai :
+la 2.1.0 a alors été refusée automatiquement, et la 2.2.0 acceptée. Je n'ai pas désactivé l'analyse k6 : je l'ai réparée.
+
+### Journal des déploiements
+
+| Heure (8 oct.) | Action | PR / commit | Ce que j'ai observé | Qui a agi |
+|---|---|---|---|---|
+| vers 11:10 | Synchronisation du fork avec le dépôt du cours | PR `sync-prof`, commit `6b08cec` | `exemples/robustesse/` et `scripts/charge.sh` récupérés | moi (Git) |
+| 11:17:54 | Étalon : `./scripts/charge.sh http://taskflow` | - | 2.0.0 : 0,00 % d'erreurs, p95 = 5,43 ms | moi |
+| vers 11:24 | Merge de « Canary avec analyse automatique k6 » | PR #13, commit `ffda5c9` | à 11:26:34 : AnalysisTemplate, ConfigMap et Service `taskflow-canary` créés | moi (Git), Argo CD |
+| vers 11:33 | Merge de « Image 2.1.0 » | PR #14, commit `f86e196` | vers 11:36 : AnalysisRun **Successful**, puis 2.1.0 à 100 % vers 11:38 | moi (Git), Argo CD, Argo Rollouts |
+| 11:54:51 | Contrôle avec `observe.sh` | - | 2.1.0 en production, 25 % de `http=500` | moi |
+| vers 12:06 | Merge du revert de la PR #14 | PR de revert | à 12:08:05 : AnalysisRun **Failed**, retour abandonné, production toujours en 2.1.0 | moi (Git), Argo Rollouts |
+| 12:18:52 | `kubectl argo rollouts promote taskflow --full` | - | à 12:19:09 : Healthy en 2.0.0, fin de l'incident | moi (commande), Argo Rollouts |
+| vers 12:27 | Merge de « Analyse : pause avant k6 et connexions non réutilisées » | commit `b003c5b` | à 12:28:19 : correction en place, production inchangée | moi (Git), Argo CD |
+| vers 12:29 | Merge de « Image 2.1.0 (après correction de l'analyse) » | PR #17 | à 12:31:18 : AnalysisRun **Failed**, abandon automatique, production restée en 2.0.0 | moi (Git), Argo Rollouts (abandon) |
+| vers 13:58 | Merge du revert de la PR #17 | PR de revert | à 14:00:10 : Rollout Healthy, application Synced | moi (Git), Argo CD |
+| vers 14:03 | Merge de « Image 2.2.0 » | commit `49f7d42` | à 14:04:29 : AnalysisRun **Successful** ; à 14:05:42 : Healthy en 2.2.0 à 100 % | moi (Git), Argo CD, Argo Rollouts |
+
+Les heures précédées de « vers » ne sont pas chronométrées. Les heures exactes des merges sont visibles sur les PR.
+
+### A. L'étalon et l'analyse automatique
+
+**L'étalon.** Avant de changer quoi que ce soit, j'ai mesuré la version saine. C'est la référence de tout le labo.
+
+```
+11:17:54
+Status:          ✔ Healthy
+Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.0.0 (stable)
+    http_req_duration
+    ✓ 'p(95)<250' p(95)=5.43ms
+    http_req_failed
+    ✓ 'rate<0.02' rate=0.00%
+    http_req_failed................: 0.00% 0 out of 735
+Résultat : seuils respectés.
+```
+
+**L'analyse.** J'ai copié les fichiers de `exemples/robustesse/` dans `apps/taskflow/` (PR #13). Je n'avais plus de `deployment.yaml` à supprimer :
+il l'avait été au labo 2. Le Rollout lance maintenant un test k6 au palier de 25 %, à travers le Service `taskflow-canary`.
+
+```
+11:26:34
+analysistemplate.argoproj.io/robustesse-k6   1s
+configmap/k6-robustesse      1      1s
+service/taskflow-canary   ClusterIP   10.96.247.74   <none>        80/TCP    1s
+Status:          ✔ Healthy
+Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.0.0 (stable)
+```
+
+### B. L'incident
+
+**B1. Premier essai : la 2.1.0 passe.** Après le merge de la PR #14, je n'ai touché à rien. L'analyse a réussi et la 2.1.0 est allée jusqu'à 100 %.
+
+```
+11:54:51
+Status:          ✔ Healthy
+Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.1.0 (stable)
+│  └──α taskflow-df976ccb5-6-1                                       AnalysisRun  ✔ Successful  19m   ✔ 1
+     28 version=2.1.0 http=200
+     12 version=aucune http=500
+```
+
+**B2. L'enquête.** J'ai d'abord mesuré, sans rien modifier.
+
+| Mesure | Résultat | Ce que ça m'a appris |
+|---|---|---|
+| `observe.sh`, 5 fois (11:54 à 11:58) | 50 erreurs `http=500` sur 200, soit 25 % | la 2.1.0 est bien cassée |
+| Rapport k6 de l'analyse | 731 requêtes, 0,00 % d'erreurs, p95 = 7,75 ms, maximum 16 ms | pour le test, tout allait bien |
+| `charge.sh` sur la production (12:00) | 25,66 % d'erreurs, p95 = 307 ms, minimum 301 ms | le scénario k6 sait détecter ce bug |
+| `diff -r exemples/robustesse apps/taskflow` | identiques, sauf la ligne de l'image | je n'ai pas mal configuré les fichiers |
+
+Le même scénario donnait donc 0 % d'erreurs pendant l'analyse et 25 % à la main. Et pendant l'analyse, la réponse la plus lente était à 16 ms,
+alors qu'aucune réponse de la 2.1.0 ne descend sous 301 ms. Le test n'avait pas parlé à la 2.1.0.
+
+**B3. Le revert, bloqué.** J'ai fait le revert de la PR #14. L'analyse a alors refusé le retour à la version saine :
+
+```
+12:08:05
+Status:          ✖ Degraded
+Message:         RolloutAborted: Rollout aborted update to revision 7: Step-based analysis phase error/failed: Metric "test-de-charge-k6" assessed Failed due to failed (1) > failureLimit (0)
+│  └──α taskflow-c6cf57bd6-7-1                                       AnalysisRun  ✖ Failed       41s   ✖ 1
+     27 version=2.1.0 http=200
+     13 version=aucune http=500
+```
+
+Le verdict était inversé : la mauvaise version acceptée, la bonne refusée. Le test jugeait la version déjà en place, pas la nouvelle.
+Le journal d'Argo Rollouts donne les heures (en UTC, donc 12:07 à Paris) :
+
+```
+10:07:24Z  Switched selector for service 'taskflow-canary' from 'df976ccb5' to 'c6cf57bd6'
+10:07:55Z  (k6) thresholds on metrics 'http_req_duration, http_req_failed' have been crossed
+           http_req_duration: min=300.95ms   http_req_failed: 33.33% 100 out of 300
+```
+
+Le Service a basculé à 12:07:24 et k6 a démarré à 12:07:25, une seconde après. Ses 300 requêtes sont pourtant toutes parties vers les anciens pods.
+
+Pour finir le retour, j'ai sauté l'analyse pour ce déploiement, sans la supprimer de Git :
+
+```
+12:18:52
+rollout 'taskflow' fully promoted
+12:19:09
+Status:          ✔ Healthy
+12:21:03
+Images:          ghcr.io/9m7fjfpv9k-cyber/taskflow:2.0.0 (stable)
+     40 version=2.0.0 http=200
+     40 version=2.0.0 http=200
+```
+
+**B4. La correction.** Deux changements, trois lignes, par PR (commit `b003c5b`) :
+
+```diff
+ # apps/taskflow/rollout.yaml
+         - setWeight: 25
++        - pause:
++            duration: 10s
+         - analysis:
+
+ # apps/taskflow/configmap-k6.yaml
+       duration: '30s',
++      noConnectionReuse: true,
+       thresholds: {
+```
+
+- La pause laisse 10 secondes au Service pour pointer vers le nouveau pod avant que k6 démarre.
+- `noConnectionReuse` oblige k6 à ouvrir une nouvelle connexion à chaque requête, au lieu de rester branché sur les premiers pods contactés.
+
+Je n'ai pas commenté la partie k6 : ça aurait laissé passer le revert, mais aussi la prochaine mauvaise version.
+
+**B5. Deuxième essai : abandon automatique.** Même version 2.1.0, même scénario, mêmes seuils. Cette fois, je n'ai rien eu à faire
+(extraits de la sortie, une ligne par moment clé) :
+
+```
+12:30:30   SetWeight: 25      taskflow:2.1.0 (canary)
+12:30:35   Status: ॥ Paused   (pause de 10 s)
+12:30:41   AnalysisRun taskflow-df976ccb5-8-2   ◌ Running
+12:31:18   Status: ✖ Degraded
+           Message: RolloutAborted: Rollout aborted update to revision 8: ... Metric "test-de-charge-k6" assessed Failed
+           Images:  ghcr.io/9m7fjfpv9k-cyber/taskflow:2.0.0 (stable)
+     40 version=2.0.0 http=200
+```
+
+Le rapport du test, cette fois sur le bon pod :
+
+```
+    ✗ 'p(95)<250' p(95)=312.12ms
+    ✗ 'rate<0.02' rate=30.33%
+    http_req_duration..............: avg=306.42ms min=300.92ms med=305.53ms max=332.02ms
+    http_req_failed................: 30.33% 91 out of 300
+level=error msg="thresholds on metrics 'http_req_duration, http_req_failed' have been crossed"
+```
+
+**B6. Ce que fait la 2.1.0.** Sur un pod lancé à part, hors production (13:55) :
+
+```
+/      -> {"app":"TaskFlow","version":"2.1.0","pod":"debug-210"} | http=200 temps=0.305925s
+/tasks -> []                                                      | http=200 temps=0.303467s
+/tasks -> {"detail":"Erreur interne"}                             | http=500 temps=0.305774s
+INFO:     10.244.0.112:40598 - "GET /health HTTP/1.1" 200 OK
+```
+
+Chaque réponse prend 300 ms, certaines échouent, mais `/health` répond `200 OK`. Kubernetes ne surveille que `/health` :
+pour lui, le pod était `Running` et prêt.
+
+**B7. La 2.2.0 jusqu'à 100 %.** Après le revert de la PR #17 (Healthy à 14:00:10), j'ai déployé la 2.2.0
+(extraits de la sortie, une ligne par moment clé) :
+
+```
+14:03:52   SetWeight: 25    taskflow:2.2.0 (canary)   AnalysisRun taskflow-7ddd57d788-10-2  ◌ Running
+14:04:29   SetWeight: 50                              AnalysisRun taskflow-7ddd57d788-10-2  ✔ Successful
+14:05:00   SetWeight: 75
+14:05:37   SetWeight: 100
+14:05:42   Status: ✔ Healthy    Images: ghcr.io/9m7fjfpv9k-cyber/taskflow:2.2.0 (stable)
+     40 version=2.2.0 http=200
+```
+
+Le rapport k6 de la 2.2.0 : 725 requêtes, 0,00 % d'erreurs, p95 = 10,03 ms.
+
+![Rapport k6 de la 2.2.0 : seuils respectés](labo3-02-k6-2.2.0.png)
+
+**Les analyses sur un seul écran (14:11).** Cette capture réunit l'AnalysisRun en échec de la 2.1.0 et celui en succès de la 2.2.0,
+ainsi que les deux analyses faussées du matin :
+
+![Rollout en 2.2.0 : AnalysisRun Successful (révision 10) et Failed (révision 8)](labo3-01-analyses.png)
+
+| Révision | Version déployée | AnalysisRun | Lecture |
+|---|---|---|---|
+| 10 | 2.2.0 | `taskflow-7ddd57d788-10-2` : **Successful** | la version corrigée est acceptée |
+| 9 | 2.0.0 (revert) | aucune | la 2.0.0 tournait déjà, rien à déployer |
+| 8 | 2.1.0 | `taskflow-df976ccb5-8-2` : **Failed** | la version boguée est refusée, après correction du test |
+| 7 | 2.0.0 (revert) | `taskflow-c6cf57bd6-7-1` : Failed | à tort : le test visait les anciens pods, en 2.1.0 |
+| 6 | 2.1.0 | `taskflow-df976ccb5-6-1` : Successful | à tort : le test visait les anciens pods, en 2.0.0 |
+
+### Les rapports k6 côte à côte
+
+| Test | Version réellement testée | Erreurs | p95 | Verdict |
+|---|---|---|---|---|
+| Étalon (11:17) | 2.0.0 | 0,00 % | 5,43 ms | seuils respectés |
+| Analyse du 1er essai 2.1.0 (11:36) | 2.0.0, par erreur | 0,00 % | 7,75 ms | Successful, à tort |
+| `charge.sh` sur la production (12:00) | 2.1.0 | 25,66 % | 307 ms | seuils dépassés |
+| Analyse du revert (12:07) | 2.1.0, par erreur | 33,33 % | 308 ms | Failed, à tort |
+| Analyse du 2e essai 2.1.0 (12:31) | 2.1.0 | 30,33 % | 312 ms | Failed, à raison |
+| Analyse de la 2.2.0 (14:04) | 2.2.0 | 0,00 % | 10,03 ms | Successful, à raison |
+
+### Ma méthode pour débloquer
+
+1. **Comparer à l'étalon.** Le test « réussi » affichait 16 ms au maximum. La 2.1.0 ne répond jamais sous 300 ms. Ce chiffre m'a mis sur la piste.
+2. **Mesurer avant de modifier.** J'avais deux idées de correction (tester une autre route, ajouter `abortOnFail`). Les mesures ont montré que ni l'une ni l'autre n'aurait rien changé.
+3. **Une hypothèse à la fois, et une mesure pour la départager.** J'en ai écarté quatre. Elles sont dans le postmortem.
+4. **Lire les journaux avec leurs heures.** C'est l'écart d'une seconde entre la bascule du Service et le démarrage de k6 qui a donné la cause.
+5. **Corriger petit, puis refaire exactement le même essai.** Même version, même scénario, mêmes seuils : seul le résultat a changé.
+
+### Ce qui m'a posé problème dans ce labo
+
+- Voir un test vert et une production cassée en même temps. J'ai d'abord cru à une erreur de ma part dans les fichiers.
+- Le revert bloqué par l'outil censé me protéger. Je ne savais pas qu'on pouvait finir un déploiement avec `promote --full`.
+- Mes premières explications étaient fausses. Sans les mesures, j'aurais corrigé au mauvais endroit.
+- La commande `get rollout` colore ses mots, et mes filtres ne les reconnaissaient plus. Il faut ajouter `--no-color`.
+
+### Ce que je retiens
+
+Un test automatique qui passe ne prouve rien si on ne sait pas ce qu'il a testé. Après correction, le filet de sécurité a fait son travail :
+un pod exposé pendant 48 secondes, contre 44 minutes d'incident le matin.
